@@ -1,8 +1,11 @@
+# llm_model.py
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 import tensorflow.keras.backend as K
+import re
+from collections import Counter
 
 class PositionalEncoding(layers.Layer):
     def __init__(self, position, d_model):
@@ -20,9 +23,7 @@ class PositionalEncoding(layers.Layer):
             d_model
         )
         
-        # Apply sin to even indices
         sines = np.sin(angle_rads[:, 0::2])
-        # Apply cos to odd indices
         cosines = np.cos(angle_rads[:, 1::2])
         
         pos_encoding = np.concatenate([sines, cosines], axis=-1)
@@ -48,7 +49,7 @@ class MultiHeadAttention(layers.Layer):
         self.wv = layers.Dense(d_model)
         
         self.dense = layers.Dense(d_model)
-    
+        
     def split_heads(self, x, batch_size):
         x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
         return tf.transpose(x, perm=[0, 2, 1, 3])
@@ -56,21 +57,18 @@ class MultiHeadAttention(layers.Layer):
     def scaled_dot_product_attention(self, q, k, v, mask=None):
         matmul_qk = tf.matmul(q, k, transpose_b=True)
         
-        # Scale matmul_qk
         dk = tf.cast(tf.shape(k)[-1], tf.float32)
         scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
         
-        # Add the mask (if provided)
         if mask is not None:
             scaled_attention_logits += (mask * -1e9)
         
-        # Softmax
         attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)
-        
         output = tf.matmul(attention_weights, v)
+        
         return output, attention_weights
     
-    def call(self, v, k, q, mask):
+    def call(self, v, k, q, mask=None):
         batch_size = tf.shape(q)[0]
         
         q = self.wq(q)
@@ -108,7 +106,7 @@ class TransformerBlock(layers.Layer):
         self.dropout2 = layers.Dropout(rate)
 
     def call(self, x, training=False, mask=None):
-        attn_output, _ = self.mha(v=x, k=x, q=x, mask=mask)
+        attn_output, _ = self.mha(x, x, x, mask)
         attn_output = self.dropout1(attn_output, training=training)
         out1 = self.layernorm1(x + attn_output)
 
@@ -117,6 +115,152 @@ class TransformerBlock(layers.Layer):
         out2 = self.layernorm2(out1 + ffn_output)
 
         return out2
+
+class BPETokenizer:
+    def __init__(self, vocab_size=1000):
+        self.vocab_size = vocab_size
+        self.word_counts = {}
+        self.special_tokens = {
+            '<pad>': 0,
+            '<sos>': 1,
+            '<eos>': 2,
+            '<unk>': 3,
+            '<num>': 4
+        }
+        self.vocab = {}
+        # Initialize vocab with special tokens
+        self.vocab.update(self.special_tokens)
+        self.inverse_vocab = {v: k for k, v in self.vocab.items()}
+        self.subword_stats = {}
+        
+    def train(self, texts):
+        # Count words and initialize subwords
+        words = []
+        for text in texts:
+            clean_text = self._preprocess_text(text)
+            words.extend(clean_text.split())
+        
+        # Count word frequencies
+        self.word_counts = Counter(words)
+        
+        # Initialize subword statistics
+        for word, count in self.word_counts.items():
+            chars = list(word)
+            for i in range(len(chars) - 1):
+                pair = (chars[i], chars[i + 1])
+                self.subword_stats[pair] = self.subword_stats.get(pair, 0) + count
+        
+        # Add most common words and subwords to vocabulary
+        sorted_words = sorted(self.word_counts.items(), key=lambda x: x[1], reverse=True)
+        vocab_size_remaining = self.vocab_size - len(self.special_tokens)
+        
+        # First, add most common full words
+        word_vocab_size = vocab_size_remaining // 2
+        for word, _ in sorted_words[:word_vocab_size]:
+            if word not in self.vocab:
+                self.vocab[word] = len(self.vocab)
+                self.inverse_vocab[len(self.vocab) - 1] = word
+        
+        # Then, add most common subwords
+        sorted_subwords = sorted(self.subword_stats.items(), key=lambda x: x[1], reverse=True)
+        for (char1, char2), _ in sorted_subwords:
+            subword = char1 + char2
+            if subword not in self.vocab and len(self.vocab) < self.vocab_size:
+                self.vocab[subword] = len(self.vocab)
+                self.inverse_vocab[len(self.vocab) - 1] = subword
+    
+    def _preprocess_text(self, text):
+        """Preprocess text for tokenization"""
+        # Convert to lowercase
+        text = text.lower()
+        # Replace numbers with <num> token
+        text = re.sub(r'\d+', ' <num> ', text)
+        # Add spaces around punctuation
+        text = re.sub(r'([.,!?()])', r' \1 ', text)
+        # Remove special characters
+        text = re.sub(r'[^a-z0-9.,!?()\s]', '', text)
+        # Remove extra whitespace
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+    
+    def encode(self, text, max_length=None):
+        """Convert text to token IDs with subword tokenization"""
+        # Preprocess the text
+        text = self._preprocess_text(text)
+        words = text.split()
+        
+        # Start with special tokens
+        tokens = [self.special_tokens['<sos>']]
+        
+        # Convert words to tokens
+        for word in words:
+            if word in self.vocab:
+                tokens.append(self.vocab[word])
+            else:
+                # Try subword tokenization
+                subwords = self._segment_word(word)
+                if subwords:
+                    tokens.extend(subwords)
+                else:
+                    tokens.append(self.special_tokens['<unk>'])
+        
+        # Add end token
+        tokens.append(self.special_tokens['<eos>'])
+        
+        # Handle max_length
+        if max_length is not None:
+            if len(tokens) < max_length:
+                # Pad sequence
+                tokens.extend([self.special_tokens['<pad>']] * (max_length - len(tokens)))
+            else:
+                # Truncate sequence
+                tokens = tokens[:max_length-1] + [self.special_tokens['<eos>']]
+        
+        return tokens
+    
+    def _segment_word(self, word):
+        """Segment word into subwords"""
+        if not word:
+            return []
+            
+        tokens = []
+        while word:
+            found = False
+            # Try to find the longest matching subword
+            for i in range(len(word), 0, -1):
+                subword = word[:i]
+                if subword in self.vocab:
+                    tokens.append(self.vocab[subword])
+                    word = word[i:]
+                    found = True
+                    break
+            if not found:
+                # If no subword is found, take the first character as unknown
+                tokens.append(self.special_tokens['<unk>'])
+                word = word[1:]
+        return tokens
+    
+    def decode(self, tokens):
+        """Convert token IDs back to text"""
+        words = []
+        current_word = []
+        
+        for token in tokens:
+            if token in self.inverse_vocab:
+                word = self.inverse_vocab[token]
+                if word in {'<pad>', '<sos>', '<eos>', '<unk>', '<num>'}:
+                    if current_word:
+                        words.append(''.join(current_word))
+                        current_word = []
+                    if word == '<num>':
+                        words.append('0')
+                else:
+                    current_word.append(word)
+        
+        if current_word:
+            words.append(''.join(current_word))
+        
+        return ' '.join(words)
 
 class SimpleLLM(tf.keras.Model):
     def __init__(self, num_layers, d_model, num_heads, dff, vocab_size, 
@@ -167,198 +311,30 @@ class SimpleLLM(tf.keras.Model):
         x = self.final_layer(x)
         return x
 
-# Example usage
-def create_model(vocab_size=10000):
-    model = SimpleLLM(
-        num_layers=6,          # Number of transformer blocks
-        d_model=512,          # Embedding dimension
-        num_heads=8,          # Number of attention heads
-        dff=2048,            # Feed-forward network dimension
-        vocab_size=vocab_size,
-        maximum_position_encoding=5000
-    )
-    return model
-
-# Training configuration
-def get_training_config():
-    return {
-        'optimizer': tf.keras.optimizers.Adam(
-            learning_rate=CustomSchedule(512),
-            beta_1=0.9,
-            beta_2=0.98,
-            epsilon=1e-9
-        ),
-        'loss': tf.keras.losses.SparseCategoricalCrossentropy(
-            from_logits=True
-        ),
-        'metrics': [tf.keras.metrics.SparseCategoricalAccuracy()]
-    }
-
-# Learning rate schedule
-class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
-    def __init__(self, d_model, warmup_steps=4000):
-        super(CustomSchedule, self).__init__()
-        
-        self.d_model = d_model
-        self.d_model = tf.cast(self.d_model, tf.float32)
-        self.warmup_steps = warmup_steps
-        
-    def __call__(self, step):
-        step = tf.cast(step, tf.float32)
-        arg1 = tf.math.rsqrt(step)
-        arg2 = step * (self.warmup_steps ** -1.5)
-        
-        return tf.math.rsqrt(self.d_model) * tf.math.minimum(arg1, arg2)
-
-# Advanced Tokenization
-class BPETokenizer:
-    def __init__(self, vocab_size=50000):
-        self.vocab_size = vocab_size
-        self.vocab = {}
-        self.reverse_vocab = {}
-        self.special_tokens = {
-            '<pad>': 0,
-            '<sos>': 1,
-            '<eos>': 2,
-            '<unk>': 3
-        }
-        
-    def train(self, texts):
-        # Initialize with characters
-        words = []
-        for text in texts:
-            words.extend(text.split())
-        
-        # Count character pairs
-        char_pairs = {}
-        word_pieces = {}
-        
-        for word in words:
-            chars = list(word)
-            if len(chars) == 1:
-                continue
-            
-            for i in range(len(chars) - 1):
-                pair = (chars[i], chars[i + 1])
-                char_pairs[pair] = char_pairs.get(pair, 0) + 1
-                
-        # Merge most frequent pairs until vocab_size is reached
-        vocab = list(self.special_tokens.keys())
-        for i in range(len(vocab), self.vocab_size):
-            if not char_pairs:
-                break
-                
-            best_pair = max(char_pairs.items(), key=lambda x: x[1])[0]
-            new_token = ''.join(best_pair)
-            vocab.append(new_token)
-            
-            # Update pairs
-            char_pairs = self._update_pairs(char_pairs, best_pair, new_token)
-            
-        # Create vocabulary
-        self.vocab = {token: idx for idx, token in enumerate(vocab)}
-        self.reverse_vocab = {idx: token for token, idx in self.vocab.items()}
-        
-    def _update_pairs(self, pairs, pair_to_merge, new_token):
-        new_pairs = {}
-        for pair, count in pairs.items():
-            if pair == pair_to_merge:
-                continue
-            if pair[0] in pair_to_merge or pair[1] in pair_to_merge:
-                continue
-            new_pairs[pair] = count
-        return new_pairs
-        
-    def encode(self, text, max_length=None):
-        tokens = []
-        words = text.split()
-        
-        tokens.append(self.special_tokens['<sos>'])
-        
-        for word in words:
-            chars = list(word)
-            while len(chars) > 1:
-                best_pair = None
-                best_token = None
-                
-                for i in range(len(chars) - 1):
-                    pair = (chars[i], chars[i + 1])
-                    merged = ''.join(pair)
-                    if merged in self.vocab:
-                        if best_pair is None or len(merged) > len(best_token):
-                            best_pair = i
-                            best_token = merged
-                
-                if best_pair is None:
-                    break
-                    
-                chars[best_pair:best_pair + 2] = [best_token]
-            
-            for piece in chars:
-                if piece in self.vocab:
-                    tokens.append(self.vocab[piece])
-                else:
-                    tokens.append(self.special_tokens['<unk>'])
-                    
-        tokens.append(self.special_tokens['<eos>'])
-        
-        if max_length is not None:
-            if len(tokens) < max_length:
-                tokens.extend([self.special_tokens['<pad>']] * (max_length - len(tokens)))
-            else:
-                tokens = tokens[:max_length]
-                
-        return tokens
-        
-    def decode(self, tokens):
-        return ' '.join([self.reverse_vocab.get(token, '<unk>') for token in tokens])
-
-import re
-
-# Data Preprocessing
 class DataPreprocessor:
     def __init__(self, max_length=512):
         self.max_length = max_length
         self.tokenizer = None
         
-    def preprocess_text(self, text):
-        # Basic text cleaning
-        text = text.lower()
-        text = re.sub(r'[^\w\s]', '', text)
-        text = re.sub(r'\s+', ' ', text)
-        return text.strip()
-        
     def prepare_dataset(self, texts, batch_size=32):
-        # Create and train tokenizer
+        # Create and train tokenizer if it doesn't exist
         if self.tokenizer is None:
             self.tokenizer = BPETokenizer()
-            cleaned_texts = [self.preprocess_text(text) for text in texts]
-            self.tokenizer.train(cleaned_texts)
+            self.tokenizer.train(texts)
             
         # Tokenize all texts
         encoded_texts = []
         for text in texts:
-            cleaned = self.preprocess_text(text)
-            encoded = self.tokenizer.encode(cleaned, self.max_length)
+            encoded = self.tokenizer.encode(text, self.max_length)
             encoded_texts.append(encoded)
             
         # Create training pairs (input, target)
         input_texts = encoded_texts
-        target_texts = [text[1:] + [self.tokenizer.special_tokens['<pad>']] for text in encoded_texts]
+        target_texts = [text[1:] + [self.tokenizer.special_tokens['<pad>']] 
+                       for text in encoded_texts]
         
         # Convert to TensorFlow dataset
         dataset = tf.data.Dataset.from_tensor_slices((input_texts, target_texts))
         dataset = dataset.shuffle(10000).batch(batch_size, drop_remainder=True)
         
         return dataset
-
-# Example of how to prepare data
-def prepare_data(text, tokenizer, max_length):
-    # Tokenize and pad sequences
-    sequences = tokenizer.texts_to_sequences([text])
-    padded = tf.keras.preprocessing.sequence.pad_sequences(
-        sequences,
-        maxlen=max_length,
-        padding='post'
-    )
-    return padded

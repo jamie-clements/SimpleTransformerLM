@@ -23,18 +23,49 @@ def get_memory_usage():
     return process.memory_info().rss / 1024 / 1024  # Convert to MB
 
 def create_sample_dataset():
-    """Create a small dataset for training example"""
+    """Create a diverse dataset for training example"""
     return [
+        # Basic examples
         "The quick brown fox jumps over the lazy dog.",
         "I love learning about artificial intelligence and machine learning.",
         "Python is a versatile programming language used in data science.",
         "Neural networks are inspired by biological brains.",
         "Deep learning has revolutionized natural language processing.",
-        "Transformers have become the standard for language models.",
-        "Machine learning models learn patterns from data.",
-        "Artificial intelligence is changing the world rapidly.",
-        "Data science combines statistics and programming.",
-        "Computer vision helps machines understand images."
+        
+        # Technology and Science
+        "Quantum computers manipulate individual atoms to process information.",
+        "Space exploration reveals new mysteries about our universe daily.",
+        "Renewable energy sources become more efficient each year.",
+        "DNA sequencing helps understand genetic diseases better.",
+        "Robotics and automation transform modern manufacturing.",
+        
+        # Nature and Environment
+        "The Amazon rainforest contains countless undiscovered species.",
+        "Ocean currents influence global weather patterns significantly.",
+        "Polar ice caps reflect sunlight back into space.",
+        "Coral reefs support diverse marine ecosystems worldwide.",
+        "Volcanic eruptions can affect global temperatures.",
+        
+        # Education and Learning
+        "Students learn best through practical applications.",
+        "Critical thinking skills develop through challenging problems.",
+        "Reading extensively improves vocabulary and comprehension.",
+        "Mathematics provides tools for understanding patterns.",
+        "Scientific method guides systematic investigation.",
+        
+        # Society and Culture
+        "Social media connects people across vast distances.",
+        "Cultural diversity enriches human experience significantly.",
+        "Art expresses emotions that transcend language barriers.",
+        "Music brings people together regardless of background.",
+        "Traditional customs preserve historical knowledge.",
+        
+        # Innovation and Progress
+        "Electric vehicles reduce environmental impact.",
+        "Solar panels convert sunlight into usable energy.",
+        "Artificial intelligence assists medical diagnosis.",
+        "Virtual reality creates immersive learning experiences.",
+        "Blockchain technology ensures transparent transactions."
     ]
 
 def test_model_forward_pass(model, test_input):
@@ -70,34 +101,58 @@ def test_model_forward_pass(model, test_input):
         logger.error(traceback.format_exc())
         return False
 
-def generate_text(model, preprocessor, prompt, max_length=30, temperature=1.0):
-    """Generate text from a prompt with temperature sampling"""
+def generate_text(model, preprocessor, prompt, max_length=30, temperature=0.7):
+    """Generate text with dynamic temperature and top-k sampling"""
     logger.info(f"Generating text for prompt: '{prompt}'")
     try:
         input_ids = preprocessor.tokenizer.encode(prompt)
-        input_ids = tf.cast(tf.expand_dims(input_ids, 0), tf.int32)  # Cast to int32
+        input_ids = tf.cast(tf.expand_dims(input_ids, 0), tf.int32)
         
-        for _ in range(max_length):
+        generated_text = []
+        
+        for i in range(max_length):
+            # Dynamic temperature: start higher, gradually decrease
+            current_temp = temperature * (1.0 - (i / max_length) * 0.3)
+            
             predictions = model(input_ids, training=False)
-            predictions = predictions[:, -1, :] / temperature  # Remove the extra dimension
-            predictions = tf.reshape(predictions, (1, -1))     # Reshape to (batch_size, vocab_size)
+            predictions = predictions[:, -1, :] / current_temp
             
-            # Generate and cast to int32
-            predicted_id = tf.cast(
-                tf.random.categorical(predictions, num_samples=1)[0], 
-                tf.int32
+            # Top-k sampling
+            k = 40
+            top_k_predictions = tf.math.top_k(predictions, k)
+            indices = top_k_predictions.indices[0]
+            values = top_k_predictions.values[0]
+            
+            # Apply softmax to get probabilities
+            probs = tf.nn.softmax(values)
+            
+            # Sample from top-k
+            predicted_id = tf.random.categorical(
+                tf.math.log(tf.reshape(probs, (1, -1))),
+                num_samples=1
             )
+            predicted_id = indices[predicted_id[0][0]]
             
-            # Ensure both tensors are int32 before concatenation
-            input_ids = tf.concat([
-                input_ids,
-                tf.reshape(predicted_id, (1, 1))  # Reshape to match input_ids dimensions
-            ], axis=1)
+            # Cast and reshape
+            predicted_id = tf.cast(predicted_id, tf.int32)
+            predicted_id = tf.reshape(predicted_id, (1, 1))
             
-            if predicted_id == preprocessor.tokenizer.special_tokens['<eos>']:
+            # Append to input_ids
+            input_ids = tf.concat([input_ids, predicted_id], axis=1)
+            
+            # Get the generated token
+            token = preprocessor.tokenizer.decode([predicted_id.numpy()[0][0]])
+            if token not in {'<pad>', '<sos>', '<eos>', '<unk>'}:
+                generated_text.append(token)
+            
+            # Stop if end token or punctuation
+            if (predicted_id == preprocessor.tokenizer.special_tokens['<eos>'] or 
+                (len(generated_text) > 3 and generated_text[-1] in {'.', '!', '?'})):
                 break
         
-        return preprocessor.tokenizer.decode(input_ids[0].numpy())
+        full_text = ' '.join([prompt] + generated_text)
+        return ' '.join(full_text.split())  # Clean up spaces
+        
     except Exception as e:
         logger.error(f"Error in text generation: {str(e)}")
         return f"Error generating text: {str(e)}"
@@ -114,13 +169,15 @@ def main():
     # Model configuration
     config = {
         'batch_size': 2,
-        'epochs': 5,
+        'epochs': 10,
         'max_length': 64,
         'd_model': 256,
         'num_layers': 2,
         'num_heads': 4,
         'dff': 512,
-        'learning_rate': 1e-4
+        'learning_rate': 1e-4,
+        'vocab_size': 1000,
+        'dropout_rate': 0.1
     }
     
     logger.info("Model configuration:")
@@ -131,6 +188,7 @@ def main():
     logger.info("Preparing dataset...")
     try:
         training_texts = create_sample_dataset()
+        logger.info(f"Created dataset with {len(training_texts)} examples")
         preprocessor = DataPreprocessor(max_length=config['max_length'])
         dataset = preprocessor.prepare_dataset(
             texts=training_texts,
@@ -151,8 +209,9 @@ def main():
             d_model=config['d_model'],
             num_heads=config['num_heads'],
             dff=config['dff'],
-            vocab_size=preprocessor.tokenizer.vocab_size,
-            maximum_position_encoding=config['max_length']
+            vocab_size=config['vocab_size'],
+            maximum_position_encoding=config['max_length'],
+            rate=config['dropout_rate']
         )
         logger.info("Model created successfully")
         logger.info(f"Memory usage after model creation: {get_memory_usage():.2f} MB")
@@ -165,7 +224,12 @@ def main():
     logger.info("Compiling model...")
     try:
         model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=config['learning_rate']),
+            optimizer=tf.keras.optimizers.Adam(
+                learning_rate=tf.keras.optimizers.schedules.CosineDecay(
+                    initial_learning_rate=config['learning_rate'],
+                    decay_steps=config['epochs'] * len(dataset)
+                )
+            ),
             loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
             metrics=['accuracy']
         )
@@ -178,13 +242,20 @@ def main():
     # Setup callbacks
     def generate_sample_callback(epoch, logs):
         logger.info(f"\nGenerating sample for epoch {epoch}:")
-        generated = generate_text(
-            model, 
-            preprocessor, 
+        prompts = [
             "The quick brown",
-            temperature=0.7
-        )
-        logger.info(f"Sample: {generated}\n")
+            "Artificial intelligence",
+            "The future of"
+        ]
+        for prompt in prompts:
+            generated = generate_text(
+                model, 
+                preprocessor, 
+                prompt,
+                temperature=0.7
+            )
+            logger.info(f"Prompt: {prompt}")
+            logger.info(f"Generated: {generated}\n")
         logger.info(f"Memory usage: {get_memory_usage():.2f} MB")
 
     callbacks = [
@@ -247,13 +318,21 @@ def main():
     # Generate example texts
     logger.info("\nGenerating example texts...")
     prompts = [
-        "The quick",
-        "I love",
-        "Python is"
+        "The future of technology",
+        "Deep learning is",
+        "The world needs",
+        "Science shows that",
+        "In the next decade"
     ]
     
     for prompt in prompts:
-        generated_text = generate_text(model, preprocessor, prompt, temperature=0.7)
+        generated_text = generate_text(
+            model, 
+            preprocessor, 
+            prompt, 
+            temperature=0.8,
+            max_length=50
+        )
         logger.info(f"\nPrompt: {prompt}")
         logger.info(f"Generated: {generated_text}")
 
