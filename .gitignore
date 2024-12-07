@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.project
+.pydevproject
+.settings/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# Training artifacts
+runs/
+logs/
+*.weights.h5
+*.h5
+checkpoints/
+tensorboard/
+model_checkpoint_*/
+*.ckpt
+*.pb
+
+# Logs
+*.log
+logs/
+logging/
+
+# System
+.DS_Store
+Thumbs.db
+
+# Project-specific
+# Ignore large datasets if you add them later
+datasets/
+data/
+
+# Memory profiling
+*.prof
+*.memory
+
+# TensorFlow specific
+*.ckpt
+*.pb
+variables/
+saved_model/
+*.index
+*.meta
+*.data-*
+events.out.tfevents.*
+
+# Environment variables
+.env
+.env.local
+.env.*.local
